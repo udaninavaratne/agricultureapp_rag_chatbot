@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agro Q&A App</title>
+    <style>
+        body {
+            font-family: 'Arial', sans-serif;
+            background-color: #d9f1e4;
+            text-align: center;
+            margin: 50px;
+        }
+
+        h1 {
+            color: #4CAF50;
+        }
+
+        form {
+            margin-top: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        label {
+            margin-bottom: 10px;
+        }
+
+        input {
+            border: 2px solid #4CAF50;
+            border-radius: 10px;
+            padding: 10px;
+            margin-bottom: 20px;
+            width: 300px;
+            box-sizing: border-box;
+            outline: none;
+        }
+
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+
+        button:hover {
+            background-color: #45a049;
+        }
+
+        h2 {
+            margin-top: 20px;
+            color: #4CAF50;
+        }
+
+        p {
+            background-color: #d9f1e4;
+            padding: 10px;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Agro Q&A App</h1>
+    <form action="/answer" method="post">
+        <label for="question">Enter your question:</label>
+        <input type="text" id="question" name="question" required>
+        <button type="submit">Get Answer</button>
+    </form>
+    {% if question %}
+    <h2>Your Question:</h2>
+    <p>{{ question }}</p>
+    {% endif %}
+    {% if answer %}
+    <h2>Answer:</h2>
+    <div style="background:#fff; padding:12px; border-radius:10px; border:1px solid #b7e3b7; max-width:520px; margin:0 auto; text-align:left;">
+    <p style="white-space: pre-wrap; margin:0; color:#111;">{{ answer }}</p>
+    </div>
+    {% endif %}
+
+</body>
+
+</html>
