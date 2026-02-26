@@ -15,3 +15,8 @@ llm:
   model_name: gpt-4.1-mini #The LLM used to generate the answers.
   embedding_model: text-embedding-3-small #Model used to convert text into vectors.
   temperature: 0.3 #Controls randomness of the LLM.
+
+query_expansion:
+  enabled: true
+  num_queries: 4
+  model_name: gpt-4.1-mini
