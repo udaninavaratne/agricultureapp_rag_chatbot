@@ -1,0 +1,17 @@
+data:
+  csv_file_path: explanations_data.csv #Data file path
+  faiss_dir: faiss_index #This is the folder where your vector database is stored on disk.
+
+chunking:
+  chunk_size: 2500 #Maximum number of characters per chunk.
+  chunk_overlap: 200 #How much overlap between consecutive chunks.
+
+#Retrieval Section
+retrieval:
+  top_k: 4 #How many documents are sent to the LLM after reranking.
+  fetch_k: 20 #How many documents FAISS initially retrieves using vector similarity.
+
+llm:
+  model_name: gpt-4.1-mini #The LLM used to generate the answers.
+  embedding_model: text-embedding-3-small #Model used to convert text into vectors.
+  temperature: 0.3 #Controls randomness of the LLM.

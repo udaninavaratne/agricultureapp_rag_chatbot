@@ -1,30 +1,38 @@
 import os
 import textwrap
+import yaml
 import streamlit as st
 from dotenv import load_dotenv
 
 from langchain_community.document_loaders import CSVLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
-from langchain_openai import OpenAIEmbeddings
-from langchain_openai import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
+from sentence_transformers import CrossEncoder
 
-# ----------------------------
-# Config
-# ----------------------------
-CSV_FILE_PATH = "explanations_data.csv"
-CHUNK_SIZE = 2500
-CHUNK_OVERLAP = 200
-TOP_K = 4
-MODEL_NAME = "gemini-2.5-flash"
-TEMPERATURE = 0.3
-FAISS_DIR = "faiss_index"
+#Configurating prameters
+def load_config():
+    with open("config\config.yaml", "r") as file:
+        return yaml.safe_load(file)
+
+config = load_config()
+
+CSV_FILE_PATH = config["data"]["csv_file_path"]
+FAISS_DIR = config["data"]["faiss_dir"]
+
+CHUNK_SIZE = config["chunking"]["chunk_size"]
+CHUNK_OVERLAP = config["chunking"]["chunk_overlap"]
+
+TOP_K = config["retrieval"]["top_k"]
+FETCH_K = config["retrieval"]["fetch_k"]
+
+MODEL_NAME = config["llm"]["model_name"]
+EMBEDDING_MODEL = config["llm"]["embedding_model"]
+TEMPERATURE = config["llm"]["temperature"]
 
 def wrap_text_preserve_newlines(text, width=110):
     lines = text.split("\n")
@@ -33,12 +41,16 @@ def wrap_text_preserve_newlines(text, width=110):
 
 
 @st.cache_resource(show_spinner=True)
-def build_qa_pipeline():
-    """Build once and reuse (vector DB + retriever + LLM chain)."""
-    load_dotenv()
+def get_reranker():
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
+
+@st.cache_resource(show_spinner=True)
+def build_qa_pipeline():
+    load_dotenv() 
+
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") #Load the Open AI API Key
+    if not OPENAI_API_KEY :
         raise ValueError("OPENAI_API_KEY not found in .env file")
 
     if not os.path.exists(CSV_FILE_PATH):
@@ -47,7 +59,7 @@ def build_qa_pipeline():
     loader = CSVLoader(CSV_FILE_PATH, encoding="utf-8")
     data = loader.load()
 
-    # Chunking
+    #Chunking - Split the CSV text into Fixed Chunks in a special way (Recursive)
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -55,17 +67,16 @@ def build_qa_pipeline():
     )
     docs = splitter.split_documents(data)
 
-    #Debug
-    st.write("Total chunks:", len(docs))
-    st.write("Sample chunk preview:")
-    st.code(docs[0].page_content[:800])
+    print("Total chunks:", len(docs)) #Print the number of chunks created after splitting your CSV documents.
+    print(docs[0].page_content[:500]) #Prints the first 500 characters of the first chunk.
 
-    # Embeddings
+    #Embeddings - Convert the text chunks into Vectors
     embeddings = OpenAIEmbeddings(
-        model="text-embedding-3-small" 
+        model=EMBEDDING_MODEL,
+        openai_api_key=OPENAI_API_KEY
     )
 
-    # FAISS persistence
+    #Checks and created the FIASS Vetor database library 
     if os.path.exists(FAISS_DIR):
         db = FAISS.load_local(
             FAISS_DIR,
@@ -76,49 +87,74 @@ def build_qa_pipeline():
         db = FAISS.from_documents(docs, embeddings)
         db.save_local(FAISS_DIR)
 
+    #Re-Ranking
+    reranker = get_reranker()
+
+    base_retriever = db.as_retriever(search_kwargs={"k": FETCH_K}) #FAISS returns the top 20 similar chunks
+
+    def rerank_docs(query, docs):
+        pairs = [(query, d.page_content) for d in docs] #Create query document pairs
+        scores = reranker.predict(pairs) #The CrossEncoder reads each pair and outputs scores like
+        ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)  #Sort the pairs based on score
+        return [doc for _, doc in ranked[:TOP_K]]
+
+    def retrieve_and_rerank(query):
+        initial_docs = base_retriever.invoke(query)  
+        return rerank_docs(query, initial_docs)
+
+    #LLM
     llm = ChatOpenAI(
-        model="gpt-4.1-mini",
-        temperature=TEMPERATURE
+        model=MODEL_NAME,
+        temperature=TEMPERATURE,
+        openai_api_key=OPENAI_API_KEY
     )
 
-    retriever = db.as_retriever(search_kwargs={"k": TOP_K})
-
     prompt = ChatPromptTemplate.from_template(
-            """Use the context below to answer the question.
-    If the answer is not in the context, say you don't know.
+        """Use the context below to answer the question.
+If the answer is not in the context, say you don't know.
 
-    Context:
-    {context}
+Context:
+{context}
 
-    Question:
-    {question}
-    """
-        )
+Question:
+{question}
+"""
+    )
 
     def format_docs(docs):
         return "\n\n".join(d.page_content for d in docs)
 
+    from langchain_core.runnables import RunnableLambda
+
+    def get_context(question):
+        docs = retrieve_and_rerank(question)
+        return format_docs(docs)
+
+    context_runnable = RunnableLambda(get_context)
+
     chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        {
+            "context": context_runnable,
+            "question": RunnablePassthrough()
+        }
         | prompt
         | llm
         | StrOutputParser()
     )
 
-    return chain,retriever
+    return chain
 
 
 def main():
+    #Set the Chatbot layout 
     st.set_page_config(page_title="Agro Q&A App", page_icon="🌿", layout="centered")
 
     st.title("🌿 Agro Q&A App")
-    st.caption("Ask questions from your CSV knowledge base (RAG with FAISS + Gemini).")
+    st.caption("RAG + FAISS + Cross-Encoder Re-ranking")
 
-    # Build pipeline once
-    qa,retriever = build_qa_pipeline()
+    qa = build_qa_pipeline()
 
-    # Input
-    question = st.text_input("Enter your question", placeholder="e.g., What is the cropping system?")
+    question = st.text_input("Enter your question")
 
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -143,12 +179,11 @@ def main():
             st.session_state["question"] = q
             st.session_state["answer"] = formatted
 
-    # Output
-    if "question" in st.session_state and st.session_state["question"]:
+    if "question" in st.session_state:
         st.subheader("Your Question")
         st.write(st.session_state["question"])
 
-    if "answer" in st.session_state and st.session_state["answer"] != "":
+    if "answer" in st.session_state:
         st.subheader("Answer")
         st.code(st.session_state["answer"], language="text")
 
