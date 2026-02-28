@@ -1,6 +1,7 @@
 import os
 import textwrap
 import yaml
+import tempfile
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -39,61 +40,106 @@ def wrap_text_preserve_newlines(text, width=110):
     wrapped_lines = [textwrap.fill(line, width=width) for line in lines]
     return "\n".join(wrapped_lines)
 
+from langchain_community.document_loaders import CSVLoader, PyPDFLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+
+def _save_uploaded_files_to_temp(uploaded_files):
+    """Save Streamlit uploaded files to temp paths and return list of file paths."""
+    tmp_dir = tempfile.mkdtemp()
+    paths = []
+    for uf in uploaded_files:
+        path = os.path.join(tmp_dir, uf.name)
+        with open(path, "wb") as f:
+            f.write(uf.getbuffer())
+        paths.append(path)
+    return paths
+
+def _load_docs_from_paths(paths):
+    docs = []
+    for p in paths:
+        ext = os.path.splitext(p)[1].lower()
+
+        if ext == ".csv":
+            docs.extend(CSVLoader(p).load())
+        elif ext == ".pdf":
+            docs.extend(PyPDFLoader(p).load())
+        elif ext in [".txt", ".md"]:
+            docs.extend(TextLoader(p, encoding="utf-8").load())
+        else:
+            # skip unsupported for now
+            continue
+    return docs
 
 @st.cache_resource(show_spinner=True)
 def get_reranker():
     return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-
 @st.cache_resource(show_spinner=True)
-def build_qa_pipeline():
-    load_dotenv() 
+def build_qa_pipeline(uploaded_files=None,_key=None):
+    load_dotenv()
 
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") #Load the Open AI API Key
-    if not OPENAI_API_KEY :
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+    if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY not found in .env file")
 
-    if not os.path.exists(CSV_FILE_PATH):
+    if not uploaded_files and not os.path.exists(CSV_FILE_PATH):
         raise FileNotFoundError(f"CSV file not found: {CSV_FILE_PATH}")
 
-    loader = CSVLoader(CSV_FILE_PATH, encoding="utf-8")
-    data = loader.load()
+    # ----------------------------
+    # 1) Load docs
+    # ----------------------------
+    if uploaded_files:
+        paths = _save_uploaded_files_to_temp(uploaded_files)
+        docs = _load_docs_from_paths(paths)
+    else:
+        docs = CSVLoader(CSV_FILE_PATH).load()
 
-    #Chunking - Split the CSV text into Fixed Chunks in a special way (Recursive)
+    # ----------------------------
+    # 2) Chunking
+    # ----------------------------
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " ", ""]
+        chunk_overlap=CHUNK_OVERLAP
     )
-    docs = splitter.split_documents(data)
+    chunks = splitter.split_documents(docs)
 
-    print("Total chunks:", len(docs)) #Print the number of chunks created after splitting your CSV documents.
-    print(docs[0].page_content[:500]) #Prints the first 500 characters of the first chunk.
+    print("Total chunks:", len(chunks))
+    if chunks:
+        print(chunks[0].page_content[:500])
 
-    #Embeddings - Convert the text chunks into Vectors
+    # ----------------------------
+    # 3) Embeddings
+    # ----------------------------
     embeddings = OpenAIEmbeddings(
         model=EMBEDDING_MODEL,
         openai_api_key=OPENAI_API_KEY
     )
 
-    #Checks and created the FIASS Vetor database library 
-    if os.path.exists(FAISS_DIR):
-        db = FAISS.load_local(
-            FAISS_DIR,
-            embeddings,
-            allow_dangerous_deserialization=True
-        )
-    else:
-        db = FAISS.from_documents(docs, embeddings)
-        db.save_local(FAISS_DIR)
-
-    #Re-Ranking
-    reranker = get_reranker()
-
-    base_retriever = db.as_retriever(search_kwargs={"k": FETCH_K}) #FAISS returns the top 20 similar chunks
-        # ----------------------------
-    # Query Expansion (Option 1)
     # ----------------------------
+    # 4) Vector DB (FAISS)
+    #   - If uploads exist: build from chunks in-memory (don’t reuse old FAISS_DIR)
+    #   - If no uploads: use your saved FAISS_DIR logic
+    # ----------------------------
+    if uploaded_files:
+        db = FAISS.from_documents(chunks, embeddings)
+    else:
+        if os.path.exists(FAISS_DIR):
+            db = FAISS.load_local(
+                FAISS_DIR,
+                embeddings,
+                allow_dangerous_deserialization=True
+            )
+        else:
+            db = FAISS.from_documents(chunks, embeddings)
+            db.save_local(FAISS_DIR)
+
+    # ----------------------------
+    # 5) Retriever + reranker
+    # ----------------------------
+    reranker = get_reranker()
+    base_retriever = db.as_retriever(search_kwargs={"k": FETCH_K})
+
     def expand_queries(question: str) -> list[str]:
         qe = config.get("query_expansion", {})
         enabled = bool(qe.get("enabled", True))
@@ -128,7 +174,6 @@ Question: {q}
 
         candidates = [line.strip() for line in raw.split("\n") if line.strip()]
 
-        # Always include original first, then dedupe
         all_queries = [question] + candidates
         seen = set()
         unique = []
@@ -141,20 +186,18 @@ Question: {q}
         return unique[: num_queries + 1]
 
     def rerank_docs(query, docs):
-        pairs = [(query, d.page_content) for d in docs] #Create query document pairs
-        scores = reranker.predict(pairs) #The CrossEncoder reads each pair and outputs scores like
-        ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)  #Sort the pairs based on score
+        pairs = [(query, d.page_content) for d in docs]
+        scores = reranker.predict(pairs)
+        ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
         return [doc for _, doc in ranked[:TOP_K]]
 
     def retrieve_and_rerank(query: str):
         expanded_queries = expand_queries(query)
 
-        # Retrieve for each expanded query
         all_docs = []
         for q in expanded_queries:
             all_docs.extend(base_retriever.invoke(q))
 
-        # Dedupe documents
         unique = {}
         for d in all_docs:
             meta = tuple(sorted(d.metadata.items())) if d.metadata else ()
@@ -162,11 +205,11 @@ Question: {q}
             unique[key] = d
 
         merged_docs = list(unique.values())
-
-        # Rerank against ORIGINAL query
         return rerank_docs(query, merged_docs)
 
-    #LLM
+    # ----------------------------
+    # 6) LLM + prompt
+    # ----------------------------
     llm = ChatOpenAI(
         model=MODEL_NAME,
         temperature=TEMPERATURE,
@@ -188,7 +231,6 @@ Question:
     def format_docs(docs):
         return "\n\n".join(d.page_content for d in docs)
 
-    
     def get_context(question):
         docs = retrieve_and_rerank(question)
         return format_docs(docs)
@@ -196,28 +238,48 @@ Question:
     context_runnable = RunnableLambda(get_context)
 
     chain = (
-        {
-            "context": context_runnable,
-            "question": RunnablePassthrough()
-        }
+        {"context": context_runnable, "question": RunnablePassthrough()}
         | prompt
         | llm
         | StrOutputParser()
     )
-    
-    return chain
 
+    return chain, base_retriever
+
+def _corpus_key(uploaded_files):
+    # helps st.cache_resource know when uploads changed
+    if not uploaded_files:
+        return None
+    return tuple((f.name, f.size) for f in uploaded_files)
 
 def main():
-    #Set the Chatbot layout 
+    # Set layout
     st.set_page_config(page_title="Agro Q&A App", page_icon="🌿", layout="centered")
 
-    st.title("🌿 Agro Q&A App")
+    st.title("🤖Q&A App")
     st.caption("RAG + FAISS + Cross-Encoder Re-ranking")
 
-    qa = build_qa_pipeline()
+    # 1) Upload gate (REQUIRED)
+    uploaded_files = st.file_uploader(
+        "Upload documents to start (PDF, CSV, TXT, MD)",
+        type=["pdf", "csv", "txt", "md"],
+        accept_multiple_files=True
+    )
 
-    question = st.text_input("Enter your question")
+    if not uploaded_files:
+        st.info("⬆️ Upload at least one document to start asking questions.")
+        st.stop()
+
+    # 2) Build pipeline from uploads
+    qa, retriever = build_qa_pipeline(
+        uploaded_files=uploaded_files,
+        _key=_corpus_key(uploaded_files)   # only if you added _key in signature
+    )
+    # If you DID NOT add _key to build_qa_pipeline signature, use:
+    # qa, retriever = build_qa_pipeline(uploaded_files=uploaded_files)
+
+    # 3) Question input
+    question = st.text_input("Enter your question", key="question_input")
 
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -228,10 +290,11 @@ def main():
     if clear:
         st.session_state["answer"] = ""
         st.session_state["question"] = ""
+        st.session_state["question_input"] = ""
         st.rerun()
 
     if ask:
-        q = question.strip()
+        q = (question or "").strip()
         if not q:
             st.warning("Please type a question.")
         else:
@@ -242,14 +305,13 @@ def main():
             st.session_state["question"] = q
             st.session_state["answer"] = formatted
 
-    if "question" in st.session_state:
+    if st.session_state.get("question"):
         st.subheader("Your Question")
         st.write(st.session_state["question"])
 
-    if "answer" in st.session_state:
+    if st.session_state.get("answer"):
         st.subheader("Answer")
         st.code(st.session_state["answer"], language="text")
-
 
 if __name__ == "__main__":
     main()
