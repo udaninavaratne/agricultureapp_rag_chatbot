@@ -71,10 +71,13 @@ def _load_docs_from_paths(paths):
             continue
     return docs
 
+#Make sure the reranker is not always rebuilt
 @st.cache_resource(show_spinner=True)
 def get_reranker():
-    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2") #its a model that ranks the documents based on the query
+    #it takes (Query, Document) and returns a score , ex : scores= [0.95, 0.90, 0.85, 0.80, 0.75]
 
+#Make sure the VB is not always rebuilt
 @st.cache_resource(show_spinner=True)
 def build_qa_pipeline(uploaded_files=None,_key=None):
     load_dotenv()
@@ -84,71 +87,64 @@ def build_qa_pipeline(uploaded_files=None,_key=None):
         raise ValueError("OPENAI_API_KEY not found in .env file")
 
     if not uploaded_files and not os.path.exists(CSV_FILE_PATH):
-        raise FileNotFoundError(f"CSV file not found: {CSV_FILE_PATH}")
+        raise ValueError("Please upload at least one document")
 
-    # ----------------------------
-    # 1) Load docs
-    # ----------------------------
+    #Load documents
     if uploaded_files:
         paths = _save_uploaded_files_to_temp(uploaded_files)
         docs = _load_docs_from_paths(paths)
-    else:
-        docs = CSVLoader(CSV_FILE_PATH).load()
 
-    # ----------------------------
-    # 2) Chunking
-    # ----------------------------
+    #Chunking
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP
     )
+    #We can upload multiple documents at once. So docs is a list of documents [Doc1, Doc2, Doc3, ...]
     chunks = splitter.split_documents(docs)
-
-    print("Total chunks:", len(chunks))
+    #Split each document into chunks. chunks is a list of chunks [Chunk1, Chunk2, Chunk3, ...]
+    print("Total chunks:", len(chunks)) #Print the total number of chunks
+    #Print the first chunk
     if chunks:
         print(chunks[0].page_content[:500])
 
-    # ----------------------------
-    # 3) Embeddings
-    # ----------------------------
+    # Embeddings
     embeddings = OpenAIEmbeddings(
         model=EMBEDDING_MODEL,
         openai_api_key=OPENAI_API_KEY
     )
 
-    # ----------------------------
-    # 4) Vector DB (FAISS)
-    #   - If uploads exist: build from chunks in-memory (don’t reuse old FAISS_DIR)
-    #   - If no uploads: use your saved FAISS_DIR logic
-    # ----------------------------
+    #Vector DB (FAISS)
+    #if user uploaded documents, build brand new FIASS index from the chunks
     if uploaded_files:
         db = FAISS.from_documents(chunks, embeddings)
     else:
+        #If user did not upload documents, use the saved FAISS index if it exists
         if os.path.exists(FAISS_DIR):
             db = FAISS.load_local(
                 FAISS_DIR,
                 embeddings,
                 allow_dangerous_deserialization=True
             )
+        #If no saved FAISS index, build a new one from the chunks
         else:
             db = FAISS.from_documents(chunks, embeddings)
             db.save_local(FAISS_DIR)
 
-    # ----------------------------
-    # 5) Retriever + reranker
-    # ----------------------------
-    reranker = get_reranker()
-    base_retriever = db.as_retriever(search_kwargs={"k": FETCH_K})
+    # Retriever and reranker
+    reranker = get_reranker() #Load the reranker model
+    base_retriever = db.as_retriever(search_kwargs={"k": FETCH_K}) #returns the top k documents based on the query
 
+    #Query Expansion
     def expand_queries(question: str) -> list[str]:
+        #it reads the yaml file and check if query expansion is enabled
         qe = config.get("query_expansion", {})
-        enabled = bool(qe.get("enabled", True))
+        enabled = bool(qe.get("enabled", True))#if query expansion is enabled, it will expand the query
         if not enabled:
-            return [question]
+            return [question]#if query expansion is not enabled, it will return the original query
 
-        num_queries = int(qe.get("num_queries", 4))
-        exp_model = qe.get("model_name", "gpt-4.1-mini")
-        exp_temp = float(qe.get("temperature", 0.2))
+        num_queries = int(qe.get("num_queries", 4))#number of queries to expand
+        exp_model = qe.get("model_name", "gpt-4.1-mini")#model to use for query expansion
+        exp_temp = float(qe.get("temperature", 0.2))#temperature to use for query expansion
 
         expander_llm = ChatOpenAI(
             model=exp_model,
@@ -182,7 +178,8 @@ Question: {q}
             if key not in seen:
                 seen.add(key)
                 unique.append(qq)
-
+        #return the unique queries : [Question, Query1, Query2, Query3, ...]
+        #Expand your search by generating multiple queries
         return unique[: num_queries + 1]
 
     def rerank_docs(query, docs):
@@ -207,9 +204,7 @@ Question: {q}
         merged_docs = list(unique.values())
         return rerank_docs(query, merged_docs)
 
-    # ----------------------------
-    # 6) LLM + prompt
-    # ----------------------------
+    # LLM + prompt
     llm = ChatOpenAI(
         model=MODEL_NAME,
         temperature=TEMPERATURE,
@@ -254,31 +249,29 @@ def _corpus_key(uploaded_files):
 
 def main():
     # Set layout
-    st.set_page_config(page_title="Agro Q&A App", page_icon="🌿", layout="centered")
+    st.set_page_config(page_title="Q&A App", page_icon="🤖🔧", layout="centered")
 
-    st.title("🤖Q&A App")
+    st.title("🤖 Q&A App")
     st.caption("RAG + FAISS + Cross-Encoder Re-ranking")
 
-    # 1) Upload gate (REQUIRED)
+    # Request to upload the documents
     uploaded_files = st.file_uploader(
         "Upload documents to start (PDF, CSV, TXT, MD)",
         type=["pdf", "csv", "txt", "md"],
         accept_multiple_files=True
     )
 
+    # if no document uploaded show a message
     if not uploaded_files:
         st.info("⬆️ Upload at least one document to start asking questions.")
         st.stop()
 
-    # 2) Build pipeline from uploads
+    # Build the RAG piepline
     qa, retriever = build_qa_pipeline(
         uploaded_files=uploaded_files,
-        _key=_corpus_key(uploaded_files)   # only if you added _key in signature
+        _key=_corpus_key(uploaded_files) 
     )
-    # If you DID NOT add _key to build_qa_pipeline signature, use:
-    # qa, retriever = build_qa_pipeline(uploaded_files=uploaded_files)
-
-    # 3) Question input
+    #Question input
     question = st.text_input("Enter your question", key="question_input")
 
     col1, col2 = st.columns([1, 1])
