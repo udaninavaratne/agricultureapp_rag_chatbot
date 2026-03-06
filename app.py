@@ -14,6 +14,7 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_core.runnables import RunnableLambda
 from sentence_transformers import CrossEncoder
+from langchain_community.retrievers import BM25Retriever
 
 #Configurating prameters
 def load_config():
@@ -44,6 +45,19 @@ from langchain_community.document_loaders import CSVLoader, PyPDFLoader, TextLoa
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 
+def metadata_matches(doc, filters=None):
+    if not filters:
+        return True
+
+    meta = doc.metadata or {}
+
+    for key, value in filters.items():
+        if value in [None, "", "All"]:
+            continue
+        if meta.get(key) != value:
+            return False
+
+    return True
 def _save_uploaded_files_to_temp(uploaded_files):
     """Save Streamlit uploaded files to temp paths and return list of file paths."""
     tmp_dir = tempfile.mkdtemp()
@@ -59,16 +73,24 @@ def _load_docs_from_paths(paths):
     docs = []
     for p in paths:
         ext = os.path.splitext(p)[1].lower()
+        file_name = os.path.basename(p)
 
         if ext == ".csv":
-            docs.extend(CSVLoader(p).load())
+            loaded = CSVLoader(p).load()
         elif ext == ".pdf":
-            docs.extend(PyPDFLoader(p).load())
+            loaded = PyPDFLoader(p).load()
         elif ext in [".txt", ".md"]:
-            docs.extend(TextLoader(p, encoding="utf-8").load())
+            loaded = TextLoader(p, encoding="utf-8").load()
         else:
-            # skip unsupported for now
             continue
+
+        for d in loaded:
+            d.metadata = d.metadata or {}
+            d.metadata["source"] = file_name
+            d.metadata["file_type"] = ext.replace(".", "")
+
+        docs.extend(loaded)
+
     return docs
 
 #Make sure the reranker is not always rebuilt
@@ -101,6 +123,15 @@ def build_qa_pipeline(uploaded_files=None,_key=None):
     )
     #We can upload multiple documents at once. So docs is a list of documents [Doc1, Doc2, Doc3, ...]
     chunks = splitter.split_documents(docs)
+    
+    for i, chunk in enumerate(chunks):
+        chunk.metadata = chunk.metadata or {}
+        chunk.metadata["chunk_id"] = i
+    
+    # Keyword retriever (BM25)
+    bm25_retriever = BM25Retriever.from_documents(chunks)
+    bm25_retriever.k = FETCH_K
+
     #Split each document into chunks. chunks is a list of chunks [Chunk1, Chunk2, Chunk3, ...]
     print("Total chunks:", len(chunks)) #Print the total number of chunks
     #Print the first chunk
@@ -132,7 +163,17 @@ def build_qa_pipeline(uploaded_files=None,_key=None):
 
     # Retriever and reranker
     reranker = get_reranker() #Load the reranker model
-    base_retriever = db.as_retriever(search_kwargs={"k": FETCH_K}) #returns the top k documents based on the query
+
+    # Vector retriever (FAISS) with MMR
+    faiss_retriever = db.as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": FETCH_K,                 # how many docs you finally want
+            "fetch_k": max(20, FETCH_K*4),# how many candidates to consider before selecting diverse set
+            "lambda_mult": 0.5            # 0.0 = max diversity, 1.0 = max relevance
+        }
+    )
+    
 
     #Query Expansion
     def expand_queries(question: str) -> list[str]:
@@ -188,12 +229,14 @@ Question: {q}
         ranked = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
         return [doc for _, doc in ranked[:TOP_K]]
 
-    def retrieve_and_rerank(query: str):
+    def retrieve_and_rerank(query: str, filters=None):
         expanded_queries = expand_queries(query)
 
         all_docs = []
         for q in expanded_queries:
-            all_docs.extend(base_retriever.invoke(q))
+            bm25_docs = bm25_retriever.invoke(q)
+            faiss_docs = faiss_retriever.invoke(q)
+            all_docs.extend(bm25_docs + faiss_docs)
 
         unique = {}
         for d in all_docs:
@@ -202,7 +245,12 @@ Question: {q}
             unique[key] = d
 
         merged_docs = list(unique.values())
-        return rerank_docs(query, merged_docs)
+        filtered_docs = [d for d in merged_docs if metadata_matches(d, filters)]
+
+        if not filtered_docs:
+            return []
+
+        return rerank_docs(query, filtered_docs)
 
     # LLM + prompt
     llm = ChatOpenAI(
@@ -226,20 +274,29 @@ Question:
     def format_docs(docs):
         return "\n\n".join(d.page_content for d in docs)
 
-    def get_context(question):
-        docs = retrieve_and_rerank(question)
+    def get_context(inputs):
+        question = inputs["question"]
+        filters = inputs.get("filters", {})
+        docs = retrieve_and_rerank(question, filters=filters)
+
+        if not docs:
+            return "No matching context found for the selected filter."
+
         return format_docs(docs)
 
     context_runnable = RunnableLambda(get_context)
 
     chain = (
-        {"context": context_runnable, "question": RunnablePassthrough()}
+        {
+            "context": context_runnable,
+            "question": RunnableLambda(lambda x: x["question"])
+        }
         | prompt
         | llm
         | StrOutputParser()
     )
 
-    return chain, base_retriever
+    return chain, {"bm25": bm25_retriever, "faiss": faiss_retriever, "chunks": chunks}
 
 def _corpus_key(uploaded_files):
     # helps st.cache_resource know when uploads changed
@@ -271,6 +328,21 @@ def main():
         uploaded_files=uploaded_files,
         _key=_corpus_key(uploaded_files) 
     )
+    # Access chunks to build filter options
+    chunks = retriever["chunks"]
+
+    available_sources = sorted(set(
+        c.metadata.get("source", "unknown") for c in chunks
+    ))
+
+    selected_source = st.selectbox(
+        "Filter by file",
+        ["All"] + available_sources
+    )
+
+    filters = {
+        "source": None if selected_source == "All" else selected_source
+    }
     #Question input
     question = st.text_input("Enter your question", key="question_input")
 
@@ -292,12 +364,16 @@ def main():
             st.warning("Please type a question.")
         else:
             with st.spinner("Thinking..."):
-                result = qa.invoke(q)
+
+                result = qa.invoke({
+                    "question": q,
+                    "filters": filters
+                })
+
                 formatted = wrap_text_preserve_newlines(result)
 
             st.session_state["question"] = q
             st.session_state["answer"] = formatted
-
     if st.session_state.get("question"):
         st.subheader("Your Question")
         st.write(st.session_state["question"])
